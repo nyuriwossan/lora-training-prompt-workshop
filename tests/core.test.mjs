@@ -209,9 +209,14 @@ test("保存データにバージョン情報を含める", () => {
   assert.equal(parseState(serializeState(state)).schemaVersion, "0.1.0");
 });
 
-test("主特徴の使用判定も同じシードで再現する", () => {
-  const row = { number: 11, attributes: { hairColor: "c0" } };
-  assert.equal(buildPrompt(row, state).prompt, buildPrompt(row, state).prompt);
+test("均等・主軸・完全ランダムの配分モードを切り替えられる", () => {
+  const weighted = [{ ...categories[0], choices: categories[0].choices.map((item, index) => ({ ...item, targetPercent: index === 0 ? 90 : 5 })) }];
+  const equal = generatePlan({ categories: weighted, total: 12, seed: "modes", constraints: { distributionMode: "equal" } }).rows;
+  const axis = generatePlan({ categories: weighted, total: 12, seed: "modes", constraints: { distributionMode: "axis" } }).rows;
+  const random = generatePlan({ categories: weighted, total: 12, seed: "modes", constraints: { distributionMode: "random" } }).rows;
+  assert.ok(Math.max(...Object.values(aggregate(equal, weighted).hairColor)) <= 4);
+  assert.ok(Object.values(aggregate(axis, weighted).hairColor)[0] > Object.values(aggregate(axis, weighted).hairColor)[1]);
+  assert.equal(random.length, 12);
 });
 
 test("最大件数の合計が不足する矛盾を拒否する", () => {

@@ -100,7 +100,11 @@ export function allocateCounts(choices, total) {
   return Object.fromEntries(rows.map((item) => [item.id, item.count]));
 }
 
-function buildAssignment(category, total, random) {
+function buildAssignment(category, total, random, mode = "ratio") {
+  if (mode === "random") {
+    const enabled = category.choices.filter((choice) => choice.enabled !== false && choice.promptText?.trim());
+    return Array.from({ length: total }, () => enabled[Math.floor(random() * enabled.length)].id);
+  }
   const counts = allocateCounts(category.choices, total);
   const values = category.choices.flatMap((choice) => Array(counts[choice.id] || 0).fill(choice.id));
   return shuffle(values, random);
@@ -140,13 +144,21 @@ function scorePlan(rows, constraints) {
 }
 
 export function generatePlan({ categories, total, seed, constraints = {}, startNumber = 1 }) {
-  const active = categories.filter((category) => category.enabled && category.choices.some((choice) => choice.enabled !== false && choice.promptText?.trim()));
+  const mode = constraints.distributionMode || "ratio";
+  const prepared = categories.map((category) => ({
+    ...category,
+    choices: category.choices.map((choice, index) => ({
+      ...choice,
+      targetPercent: mode === "equal" ? 1 : mode === "axis" ? (index === 0 ? 50 : Math.max(1, Number(choice.targetPercent) || 1)) : choice.targetPercent,
+    })),
+  }));
+  const active = prepared.filter((category) => category.enabled && category.choices.some((choice) => choice.enabled !== false && choice.promptText?.trim()));
   if (!active.length) throw new Error("使用する分散カテゴリを1つ以上有効にしてください。");
   let best = null;
   let bestScore = Number.POSITIVE_INFINITY;
   for (let attempt = 0; attempt < 80; attempt += 1) {
     const random = seededRandom(`${seed}:${attempt}`);
-    const assignments = Object.fromEntries(active.map((category) => [category.id, buildAssignment(category, total, random)]));
+    const assignments = Object.fromEntries(active.map((category) => [category.id, buildAssignment(category, total, random, mode)]));
     const rows = Array.from({ length: total }, (_, index) => ({
       id: `prompt_${startNumber + index}_${hashSeed(`${seed}:${startNumber + index}`)}`,
       number: startNumber + index,
