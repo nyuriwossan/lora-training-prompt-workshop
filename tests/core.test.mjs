@@ -2,9 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
-  aggregate, allocateCounts, buildPrompt, calculateShortages, detectSensitive, generatePlan,
-  generateShortfallRows, parseState, replaceRowPreservingDistribution, runDiagnostics, serializeState,
+  SCHEMA_VERSION, aggregate, allocateCounts, applyUserPreset, buildPrompt, calculateShortages,
+  categoryMode, createUserPreset, detectSensitive, generatePlan, generateShortfallRows,
+  migrateState, normalizePhrase, parseState, parseUserPresets, replaceRowPreservingDistribution,
+  runDiagnostics, serializeState, serializeUserPresets,
 } from "../src/core.mjs";
+import { createInitialState, makeCategories } from "../src/presets.mjs";
 
 const choices = (amount = 3) => Array.from({ length: amount }, (_, index) => ({
   id: `c${index}`, labelJa: `候補${index}`, promptText: `choice ${index}`, enabled: true,
@@ -206,7 +209,7 @@ test("必要項目がないJSONを安全に拒否する", () => {
 });
 
 test("保存データにバージョン情報を含める", () => {
-  assert.equal(parseState(serializeState(state)).schemaVersion, "0.1.0");
+  assert.equal(parseState(serializeState(state)).schemaVersion, SCHEMA_VERSION);
 });
 
 test("均等・主軸・完全ランダムの配分モードを切り替えられる", () => {
@@ -274,4 +277,234 @@ test("主特徴の使用率と重みを独立フィールドとしてレスポ�
   assert.match(css, /\.contract-field\s*\{[^}]*min-width:\s*0[^}]*width:\s*100%/s);
   assert.match(css, /\.unit-input input\s*\{[^}]*padding-right:\s*2\.25rem/);
   assert.match(css, /@media \(max-width: 360px\)[\s\S]*\.contract-metrics\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+});
+
+function singleCategoryState(category, patch = {}) {
+  const base = createInitialState();
+  return {
+    ...base,
+    ...patch,
+    categories: [category],
+    outputOrder: [category.id],
+    contract: { ...base.contract, required: [], primary: [], constraints: [] },
+  };
+}
+
+test("日本語の黒髪候補はblack hairを出力する", () => {
+  const hair = makeCategories().find((category) => category.id === "hairColor");
+  const black = hair.choices.find((choice) => choice.labelJa === "黒");
+  const category = { ...hair, mode: "fixed", fixedChoiceId: black.id, choices: hair.choices.map((choice) => ({ ...choice, enabled: choice.id === black.id })) };
+  const plan = generatePlan({ categories: [category], total: 2, seed: "black" }).rows;
+  assert.match(buildPrompt(plan[0], singleCategoryState(category)).prompt, /black hair/);
+});
+
+test("固定カテゴリは全件同じ候補になる", () => {
+  const hair = makeCategories().find((category) => category.id === "hairColor");
+  const black = hair.choices.find((choice) => choice.labelJa === "黒");
+  const fixed = { ...hair, mode: "fixed", fixedChoiceId: black.id };
+  const rows = generatePlan({ categories: [fixed], total: 12, seed: "fixed" }).rows;
+  assert.deepEqual([...new Set(rows.map((row) => row.attributes.hairColor))], [black.id]);
+});
+
+test("分散カテゴリは指定候補を整数配分する", () => {
+  const hair = makeCategories().find((category) => category.id === "hairColor");
+  const selected = hair.choices.slice(0, 2).map((choice) => ({ ...choice, enabled: true, targetPercent: 50 }));
+  const distributed = { ...hair, mode: "distributed", choices: [...selected, ...hair.choices.slice(2).map((choice) => ({ ...choice, enabled: false }))] };
+  const rows = generatePlan({ categories: [distributed], total: 10, seed: "distributed" }).rows;
+  assert.deepEqual(Object.values(aggregate(rows, [distributed]).hairColor).filter(Boolean).sort((a, b) => a - b), [5, 5]);
+});
+
+test("未使用カテゴリはプロンプトへタグを出さない", () => {
+  const hair = makeCategories().find((category) => category.id === "hairColor");
+  const black = hair.choices.find((choice) => choice.labelJa === "黒");
+  const disabled = { ...hair, mode: "disabled", enabled: false };
+  const result = buildPrompt({ number: 1, attributes: { hairColor: black.id } }, singleCategoryState(disabled));
+  assert.equal(result.prompt.includes("black hair"), false);
+  assert.equal(categoryMode(disabled), "disabled");
+});
+
+test("左45度と右45度は別テンプレートとして保持する", () => {
+  const category = makeCategories().find((item) => item.id === "faceDirection");
+  const left = category.choices.find((choice) => choice.labelJa === "左45度");
+  const right = category.choices.find((choice) => choice.labelJa === "右45度");
+  assert.notEqual(left.id, right.id);
+  assert.match(left.promptText, /left/);
+  assert.match(right.promptText, /right/);
+});
+
+test("左右横顔は別候補として保持する", () => {
+  const category = makeCategories().find((item) => item.id === "faceDirection");
+  const left = category.choices.find((choice) => choice.labelJa === "左横顔");
+  const right = category.choices.find((choice) => choice.labelJa === "右横顔");
+  assert.notEqual(left.id, right.id);
+  assert.match(left.promptText, /full left profile/);
+  assert.match(right.promptText, /full right profile/);
+});
+
+test("横顔では正面系タグを自動除去する", () => {
+  const category = makeCategories().find((item) => item.id === "faceDirection");
+  const profile = category.choices.find((choice) => choice.labelJa === "左横顔");
+  const fixed = { ...category, mode: "fixed", fixedChoiceId: profile.id };
+  const face = singleCategoryState(fixed);
+  face.contract.required = [{ id: "front", text: "front view, both eyes visible", enabled: true, promptWeight: 1 }];
+  const result = buildPrompt({ number: 1, attributes: { faceDirection: profile.id } }, face);
+  assert.match(result.prompt, /full left profile/);
+  assert.doesNotMatch(result.prompt, /front view|both eyes visible/);
+  assert.ok(result.adjustments.length > 0);
+});
+
+test("振り向きテンプレートは後ろ向き要素を含む", () => {
+  const category = makeCategories().find((item) => item.id === "faceDirection");
+  const rear = category.choices.find((choice) => choice.labelJa === "後ろから振り向き");
+  assert.match(rear.promptText, /rear three-quarter view/);
+  assert.match(rear.promptText, /body turned away/);
+});
+
+test("目を閉じる場合はlooking at viewerを除去する", () => {
+  const gaze = makeCategories().find((item) => item.id === "gaze");
+  const closed = gaze.choices.find((choice) => choice.labelJa === "目を閉じる");
+  const fixed = { ...gaze, mode: "fixed", fixedChoiceId: closed.id };
+  const face = singleCategoryState(fixed);
+  face.contract.required = [{ id: "look", text: "looking at viewer", enabled: true, promptWeight: 1 }];
+  const result = buildPrompt({ number: 1, attributes: { gaze: closed.id } }, face);
+  assert.match(result.prompt, /eyes closed/);
+  assert.doesNotMatch(result.prompt, /looking at viewer/);
+});
+
+test("超アップと腰上を同時出力しない", () => {
+  const base = createInitialState();
+  const custom = { ...base, categories: [], outputOrder: [], contract: { ...base.contract, required: [{ id: "crop", text: "extreme close portrait, waist-up portrait", enabled: true, promptWeight: 1 }], primary: [], constraints: [] } };
+  const result = buildPrompt({ number: 1, attributes: {} }, custom);
+  assert.match(result.prompt, /extreme close portrait/);
+  assert.doesNotMatch(result.prompt, /waist-up portrait/);
+});
+
+test("短髪とロングヘアを同時出力しない", () => {
+  const base = createInitialState();
+  const custom = { ...base, categories: [], outputOrder: [], contract: { ...base.contract, required: [{ id: "hair", text: "short hair, long hair", enabled: true, promptWeight: 1 }], primary: [], constraints: [] } };
+  const result = buildPrompt({ number: 1, attributes: {} }, custom);
+  assert.match(result.prompt, /short hair/);
+  assert.doesNotMatch(result.prompt, /long hair/);
+});
+
+test("60件指定時は整数化後も合計60件になる", () => {
+  const hair = makeCategories().find((category) => category.id === "hairColor");
+  const counts = allocateCounts(hair.choices, 60);
+  assert.equal(Object.values(counts).reduce((sum, count) => sum + count, 0), 60);
+});
+
+test("固定カテゴリは偏り警告の対象外になる", () => {
+  const hair = makeCategories().find((category) => category.id === "hairColor");
+  const black = hair.choices[0];
+  const fixed = { ...hair, mode: "fixed", fixedChoiceId: black.id };
+  const plan = Array.from({ length: 10 }, (_, index) => ({ id: `r${index}`, number: index + 1, attributes: { hairColor: black.id }, status: "uncreated", rejectionReasons: [], note: "", locked: false }));
+  const result = runDiagnostics({ ...singleCategoryState(fixed), plan, objective: { primary: "キャラクターLoRA", secondary: "", count: 10 } });
+  assert.equal(result.some((warning) => warning.text.includes("髪色") && warning.text.includes("偏")), false);
+});
+
+test("顔角度の左右配分は設定比率から大きく逸脱しない", () => {
+  const direction = makeCategories().find((category) => category.id === "faceDirection");
+  const rows = generatePlan({ categories: [direction], total: 60, seed: "left-right", constraints: { maxConsecutive: { faceDirection: 2 } } }).rows;
+  const index = Object.fromEntries(direction.choices.map((choice) => [choice.id, choice]));
+  const left = rows.filter((row) => index[row.attributes.faceDirection].direction?.startsWith("left")).length;
+  const right = rows.filter((row) => index[row.attributes.faceDirection].direction?.startsWith("right")).length;
+  assert.ok(Math.abs(left - right) <= 2);
+});
+
+test("同じ顔角度が過度に連続しない", () => {
+  const direction = makeCategories().find((category) => category.id === "faceDirection");
+  const rows = generatePlan({ categories: [direction], total: 60, seed: "angle-runs", constraints: { maxConsecutive: { faceDirection: 2 } } }).rows;
+  let longest = 1; let run = 1;
+  rows.slice(1).forEach((row, index) => { run = row.attributes.faceDirection === rows[index].attributes.faceDirection ? run + 1 : 1; longest = Math.max(longest, run); });
+  assert.ok(longest <= 2);
+});
+
+test("自動テンプレートへadult系とbust系を入れない", () => {
+  const prompts = makeCategories().flatMap((category) => category.choices.map((choice) => choice.promptText)).join(", ");
+  assert.equal(detectSensitive(prompts).length, 0);
+});
+
+test("自由入力の注意語は削除せず置換候補を返す", () => {
+  const result = detectSensitive("adult male, bust portrait");
+  assert.ok(result.some((item) => item.term === "adult male"));
+  assert.ok(result.some((item) => item.replacement === "head-and-shoulders portrait"));
+});
+
+test("元LoRA発動語は生成Positiveへ残る", () => {
+  const base = createInitialState();
+  const custom = { ...base, categories: [], outputOrder: [], phrasePolicy: { ...base.phrasePolicy, sourceTriggerWords: "Source Trigger" }, contract: { ...base.contract, required: [], primary: [], constraints: [] } };
+  assert.match(buildPrompt({ number: 1, attributes: {} }, custom).prompt, /Source Trigger/);
+});
+
+test("キャプション除外語はキャプションだけから消える", () => {
+  const hair = makeCategories().find((category) => category.id === "hairColor");
+  const black = hair.choices.find((choice) => choice.labelJa === "黒");
+  const fixed = { ...hair, mode: "fixed", fixedChoiceId: black.id };
+  const custom = singleCategoryState(fixed, { captionSettings: { enabled: true, triggerWord: "newface", includeCategoryIds: ["hairColor"] }, phrasePolicy: { sourceTriggerWords: "", captionExclusions: " BLACK   HAIR ", forbiddenPositive: "", learningTargetMemo: "" } });
+  const result = buildPrompt({ number: 1, attributes: { hairColor: black.id } }, custom);
+  assert.match(result.prompt, /black hair/);
+  assert.equal(result.caption, "newface");
+});
+
+test("完全禁止語はPositiveだけから除去する", () => {
+  const base = createInitialState();
+  const custom = { ...base, categories: [], outputOrder: [], phrasePolicy: { ...base.phrasePolicy, forbiddenPositive: "  Unwanted   Tag " }, contract: { ...base.contract, required: [{ id: "ban", text: "unwanted tag, keeper", enabled: true, promptWeight: 1 }], primary: [], constraints: [] } };
+  const result = buildPrompt({ number: 1, attributes: {} }, custom);
+  assert.equal(result.prompt, "keeper");
+  assert.ok(result.adjustments.some((item) => item.includes("完全禁止語")));
+});
+
+test("語句比較は大文字小文字と連続空白を正規化する", () => {
+  assert.equal(normalizePhrase("  Black   Hair  "), normalizePhrase("black hair"));
+});
+
+test("旧0.1.0 JSONを新形式へ移行し旧候補と採用状態を保持する", () => {
+  const old = {
+    schemaVersion: "0.1.0",
+    objective: { primary: "人物／顔LoRA", secondary: "", count: 3 },
+    categories: [{ id: "legacy", label: "旧項目", enabled: true, choices: [{ id: "old-choice", labelJa: "旧候補", promptText: "legacy tag", enabled: true, targetPercent: 100 }] }],
+    plan: [{ id: "old-row", number: 1, attributes: { legacy: "old-choice" }, status: "adopted", rejectionReasons: [], note: "保持", locked: false }],
+  };
+  const migrated = migrateState(old);
+  assert.equal(migrated.schemaVersion, SCHEMA_VERSION);
+  assert.equal(migrated.objective.primary, "顔LoRA");
+  assert.ok(migrated.categories.some((category) => category.id === "legacy"));
+  assert.equal(migrated.plan[0].status, "adopted");
+  assert.equal(migrated.plan[0].note, "保持");
+});
+
+test("ユーザープリセットを保存・読込でき、計画は持ち込まない", () => {
+  const base = createInitialState();
+  const preset = createUserPreset({ ...base, faceLoraType: "fixed-character" }, "固定顔");
+  const loaded = applyUserPreset({ ...base, plan: [{ id: "x" }] }, preset);
+  assert.equal(preset.name, "固定顔");
+  assert.equal(loaded.faceLoraType, "fixed-character");
+  assert.deepEqual(loaded.plan, []);
+});
+
+test("ユーザープリセットJSONをエクスポート・インポートできる", () => {
+  const preset = createUserPreset(createInitialState(), "標準顔");
+  const restored = parseUserPresets(serializeUserPresets([preset]));
+  assert.equal(restored.length, 1);
+  assert.equal(restored[0].name, "標準顔");
+});
+
+test("日本語チップUIはARIA、役割、折りたたみ要約、プリセット操作を備える", async () => {
+  const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(source, /choice-chip-grid/);
+  assert.match(source, /aria-pressed=\{selected\}/);
+  assert.match(source, /category-role-badge/);
+  assert.match(source, /候補から分散/);
+  assert.match(source, /名前を付けて保存/);
+  assert.match(source, /プリセットを削除/);
+  assert.match(source, /const summary =/);
+});
+
+test("主要チップと役割操作は44px以上で折り返す", async () => {
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(css, /\.choice-chip-grid\s*\{[^}]*flex-wrap:\s*wrap/s);
+  assert.match(css, /\.choice-chip-grid button\s*\{[^}]*min-height:\s*56px/s);
+  assert.match(css, /\.role-selector button\s*\{[^}]*min-height:\s*44px/s);
+  assert.match(css, /\.status-selector button\s*\{[^}]*min-height:\s*44px/s);
+  assert.match(css, /overflow-wrap:\s*anywhere/);
 });

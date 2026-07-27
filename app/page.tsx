@@ -1,14 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-// @ts-ignore — pure ESM core is shared with the browser and Node tests.
 import {
-  aggregate, buildPrompt, calculateShortages, choiceIndex, generatePlan,
-  generateShortfallRows, makeId, parseState, replaceRowPreservingDistribution,
-  runDiagnostics, serializeState,
+  aggregate, applyUserPreset, buildPrompt, calculateShortages, categoryMode, detectSensitive,
+  choiceIndex, createUserPreset, generatePlan, generateShortfallRows, makeId,
+  parseState, parseUserPresets, replaceRowPreservingDistribution, runDiagnostics,
+  serializeState, serializeUserPresets,
 } from "../src/core.mjs";
-// @ts-ignore — preset data intentionally stays framework independent.
 import { applyPreset, createInitialState, PRESETS } from "../src/presets.mjs";
+import { FACE_CATEGORY_ORDER, FACE_LORA_TYPES, OBJECTIVES, applyFaceTypeToCategories } from "../src/face-data.mjs";
 
 const STEPS = [
   [1, "生成環境", "環境に合う出力構文を決めます"],
@@ -21,7 +21,6 @@ const STEPS = [
   [8, "採用・再集計", "採用分だけで不足を補います"],
 ] as const;
 
-const OBJECTIVES = ["人物／顔LoRA", "キャラクター再現LoRA", "表情／目元LoRA", "髪型／髪質LoRA", "衣装LoRA", "ポーズ／構図LoRA", "背景LoRA", "塗り／画風LoRA", "光／質感LoRA", "複合タイプ"];
 const STATUS = [
   ["uncreated", "未生成"], ["generated", "生成済み"], ["adopted", "採用"], ["pending", "保留"], ["rejected", "不採用"],
 ];
@@ -58,12 +57,18 @@ export default function Home() {
   const [pasteValues, setPasteValues] = useState<Record<string, string>>({});
   const [importPreview, setImportPreview] = useState<any>(null);
   const [bulkFormat, setBulkFormat] = useState({ negative: false, numbered: false, separator: "blank" });
+  const [userPresets, setUserPresets] = useState<any[]>([]);
+  const [userPresetName, setUserPresetName] = useState("");
+  const [selectedUserPresetId, setSelectedUserPresetId] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
+  const presetFileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     try {
       const saved = localStorage.getItem("lora-workshop-project");
       if (saved) setState(parseState(saved));
+      const savedPresets = localStorage.getItem("lora-workshop-user-presets");
+      if (savedPresets) setUserPresets(parseUserPresets(savedPresets));
     } catch { /* Start safely with the bundled preset. */ }
     setHydrated(true);
   }, []);
@@ -79,17 +84,34 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [state, hydrated]);
 
+  useEffect(() => {
+    if (!hydrated) return;
+    try { localStorage.setItem("lora-workshop-user-presets", serializeUserPresets(userPresets)); }
+    catch { setError("ユーザープリセットを保存できませんでした。古いプリセットを整理してください。"); }
+  }, [userPresets, hydrated]);
+
   const choices = useMemo(() => choiceIndex(state.categories), [state.categories]);
-  const activeCategories = useMemo(() => state.categories.filter((category: any) => category.enabled), [state.categories]);
+  const activeCategories = useMemo(() => state.categories.filter((category: any) => categoryMode(category) !== "disabled"), [state.categories]);
   const plannedCounts = useMemo(() => aggregate(state.plan, state.categories), [state.plan, state.categories]);
   const shortages = useMemo(() => calculateShortages(state.plan, state.categories), [state.plan, state.categories]);
   const adoptedCount = state.plan.filter((row: any) => row.status === "adopted").length;
   const diagnostics = useMemo(() => state.plan.length ? runDiagnostics(state) : [], [state]);
   const activeStep = Number(state.activeStep || 1);
+  const isFaceMode = state.objective.primary === "顔LoRA";
 
   function patchState(patch: any) { setState((current: any) => ({ ...current, ...patch, updatedAt: new Date().toISOString() })); }
   function updateEnvironment(key: string, value: any) { patchState({ environment: { ...state.environment, [key]: value }, plan: [] }); }
   function updateObjective(key: string, value: any) { patchState({ objective: { ...state.objective, [key]: value }, plan: [] }); }
+  function selectObjective(value: string) {
+    patchState({
+      objective: { ...state.objective, primary: value },
+      categories: value === "顔LoRA" ? applyFaceTypeToCategories(state.categories, state.faceLoraType || "general") : state.categories,
+      plan: [],
+    });
+  }
+  function updateFaceLoraType(value: string) {
+    patchState({ faceLoraType: value, categories: applyFaceTypeToCategories(state.categories, value), plan: [] });
+  }
   function flash(message: string) { setToast(message); window.setTimeout(() => setToast(""), 2600); }
   function goTo(step: number) { patchState({ activeStep: Math.max(1, Math.min(8, step)) }); window.scrollTo({ top: 0, behavior: "smooth" }); }
 
@@ -105,6 +127,12 @@ export default function Home() {
 
   function updateCategory(categoryId: string, patch: any) {
     patchState({ categories: state.categories.map((category: any) => category.id === categoryId ? { ...category, ...patch } : category), plan: [] });
+  }
+  function setCategoryMode(categoryId: string, mode: string) {
+    const category = state.categories.find((item: any) => item.id === categoryId);
+    const fixedChoiceId = category.fixedChoiceId || category.choices.find((choice: any) => choice.enabled !== false)?.id || category.choices[0]?.id || "";
+    const choices = mode === "fixed" ? category.choices.map((choice: any) => choice.id === fixedChoiceId ? { ...choice, enabled: true } : choice) : category.choices;
+    updateCategory(categoryId, { mode, enabled: mode !== "disabled", fixedChoiceId, choices });
   }
   function updateChoice(categoryId: string, choiceId: string, patch: any) {
     patchState({ categories: state.categories.map((category: any) => category.id === categoryId ? { ...category, choices: category.choices.map((choice: any) => choice.id === choiceId ? { ...choice, ...patch } : choice) } : category), plan: [] });
@@ -134,6 +162,27 @@ export default function Home() {
     const enabled = category.choices.filter((choice: any) => choice.enabled).length || 1;
     const percent = Number((100 / enabled).toFixed(2));
     updateCategory(categoryId, { choices: category.choices.map((choice: any) => ({ ...choice, targetPercent: choice.enabled ? percent : 0 })) });
+  }
+  function toggleChip(categoryId: string, choiceId: string) {
+    const category = state.categories.find((item: any) => item.id === categoryId);
+    if (categoryMode(category) === "fixed") {
+      updateCategory(categoryId, { fixedChoiceId: choiceId, choices: category.choices.map((choice: any) => choice.id === choiceId ? { ...choice, enabled: true } : choice) });
+      return;
+    }
+    const choice = category.choices.find((item: any) => item.id === choiceId);
+    updateChoice(categoryId, choiceId, { enabled: choice?.enabled === false });
+  }
+  function selectCategoryChoices(categoryId: string, kind: "all" | "none" | "recommended" | "sides") {
+    const category = state.categories.find((item: any) => item.id === categoryId);
+    const nextChoices = category.choices.map((choice: any) => ({
+      ...choice,
+      enabled: kind === "all" ? true
+        : kind === "none" ? false
+          : kind === "recommended" ? choice.recommended === true
+            : Boolean(choice.direction?.startsWith("left") || choice.direction?.startsWith("right")),
+    }));
+    const first = nextChoices.find((choice: any) => choice.enabled) || nextChoices[0];
+    updateCategory(categoryId, { choices: nextChoices, fixedChoiceId: first?.id || "" });
   }
 
   function createPlan() {
@@ -186,6 +235,56 @@ export default function Home() {
     catch (caught: any) { setError(caught.message); }
   }
   function confirmImport() { if (importPreview) { setState(importPreview); setImportPreview(null); flash("バックアップを読み込みました"); } }
+  function saveUserPreset(overwrite = false) {
+    const existing = userPresets.find((preset: any) => preset.id === selectedUserPresetId);
+    const name = userPresetName.trim() || existing?.name;
+    if (!name) { setError("プリセット名を入力してください。"); return; }
+    if (overwrite && existing) {
+      const next = createUserPreset(state, name, existing.id);
+      setUserPresets(userPresets.map((preset: any) => preset.id === existing.id ? { ...next, createdAt: existing.createdAt } : preset));
+      flash("プリセットを上書きしました");
+      return;
+    }
+    const next = createUserPreset(state, name);
+    setUserPresets([...userPresets, next]);
+    setSelectedUserPresetId(next.id);
+    setUserPresetName(next.name);
+    flash("設定プリセットを保存しました");
+  }
+  function loadUserPreset() {
+    const preset = userPresets.find((item: any) => item.id === selectedUserPresetId);
+    if (!preset) { setError("読み込むプリセットを選択してください。"); return; }
+    setState(applyUserPreset(state, preset));
+    setUserPresetName(preset.name);
+    flash("設定プリセットを読み込みました");
+  }
+  function duplicateUserPreset() {
+    const preset = userPresets.find((item: any) => item.id === selectedUserPresetId);
+    if (!preset) { setError("複製するプリセットを選択してください。"); return; }
+    const next = createUserPreset(applyUserPreset(state, preset), `${preset.name} のコピー`);
+    setUserPresets([...userPresets, next]);
+    setSelectedUserPresetId(next.id);
+    setUserPresetName(next.name);
+    flash("プリセットを複製しました");
+  }
+  function deleteUserPreset() {
+    if (!selectedUserPresetId) return;
+    setUserPresets(userPresets.filter((preset: any) => preset.id !== selectedUserPresetId));
+    setSelectedUserPresetId("");
+    setUserPresetName("");
+    flash("プリセットを削除しました");
+  }
+  function exportUserPresets() { download("lora-workshop-presets.json", serializeUserPresets(userPresets)); }
+  async function importUserPresets(file?: File) {
+    if (!file) return;
+    try {
+      const imported = parseUserPresets(await file.text());
+      const byId = new Map([...userPresets, ...imported].map((preset: any) => [preset.id, preset]));
+      setUserPresets([...byId.values()]);
+      flash(`${imported.length}件のプリセットを読み込みました`);
+    } catch (caught: any) { setError(caught.message); }
+    if (presetFileInput.current) presetFileInput.current.value = "";
+  }
 
   const stepContent: Record<number, React.ReactNode> = {
     1: <>
@@ -194,6 +293,24 @@ export default function Home() {
         <div><span className="mini-label">STARTER PRESET</span><h3>検証済みの構成から始める</h3><p>入力済みの設定へプリセットを適用すると、学習契約を置き換えます。</p></div>
         <div className="preset-row"><select value={presetId} onChange={(event) => setPresetId(event.target.value)} aria-label="プリセット">{PRESETS.map((preset: any) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select><button className="button primary" type="button" onClick={() => { if (state.plan.length && !confirm("現在の計画を消してプリセットを適用しますか？")) return; setState(applyPreset(state, presetId)); flash("プリセットを適用しました"); }}>適用する</button></div>
       </div>
+      <details className="panel user-preset-panel">
+        <summary>自分の設定プリセット</summary>
+        <p>計画や採用状態を含めず、タイプ・候補・比率・語句設定・出力環境だけを端末内へ保存します。</p>
+        <div className="user-preset-grid">
+          <Field label="保存名"><input value={userPresetName} onChange={(e) => setUserPresetName(e.target.value)} placeholder="例：固定キャラクター標準" /></Field>
+          <Field label="保存済みプリセット"><select value={selectedUserPresetId} onChange={(e) => { setSelectedUserPresetId(e.target.value); setUserPresetName(userPresets.find((preset: any) => preset.id === e.target.value)?.name || ""); }}><option value="">選択してください</option>{userPresets.map((preset: any) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></Field>
+        </div>
+        <div className="preset-actions">
+          <button type="button" className="button primary" onClick={() => saveUserPreset(false)}>名前を付けて保存</button>
+          <button type="button" className="button subtle" onClick={loadUserPreset}>読込</button>
+          <button type="button" className="button subtle" onClick={() => saveUserPreset(true)}>上書き</button>
+          <button type="button" className="button subtle" onClick={duplicateUserPreset}>複製</button>
+          <button type="button" className="button subtle danger-text" onClick={deleteUserPreset}>削除</button>
+          <button type="button" className="button subtle" onClick={exportUserPresets}>JSON出力</button>
+          <button type="button" className="button subtle" onClick={() => presetFileInput.current?.click()}>JSON読込</button>
+          <input ref={presetFileInput} hidden type="file" accept="application/json,.json" onChange={(e) => importUserPresets(e.target.files?.[0])} />
+        </div>
+      </details>
       <div className="form-grid">
         <Field label="利用環境"><select value={state.environment.platform} onChange={(e) => updateEnvironment("platform", e.target.value)}><option>PIXAIアプリ版</option><option>PIXAIブラウザ版</option><option>その他</option><option>カスタム</option></select></Field>
         <Field label="生成モデル系統"><select value={state.environment.modelFamily} onChange={(e) => updateEnvironment("modelFamily", e.target.value)}><option>SDXL系</option><option>DiT.1系</option><option>DiT.2系</option><option>その他</option><option>不明</option></select></Field>
@@ -206,7 +323,8 @@ export default function Home() {
     </>,
     2: <>
       <SectionTitle eyebrow="STEP 2 / PURPOSE" title="LoRAの役割を一つに絞る" description="主目的は一つ。副目的は必要な場合だけ選び、常に同時に学習させる特徴を増やしすぎないようにします。" />
-      <Field label="主目的"><div className="choice-grid">{OBJECTIVES.map((item) => <button type="button" key={item} className={`choice-tile ${state.objective.primary === item ? "selected" : ""}`} aria-pressed={state.objective.primary === item} onClick={() => updateObjective("primary", item)}><span>{item}</span><small>{item === "人物／顔LoRA" ? "顔立ちと人物特徴" : item === "塗り／画風LoRA" ? "描画表現と線・色" : "学習対象として設定"}</small></button>)}</div></Field>
+      <Field label="主目的"><div className="choice-grid">{OBJECTIVES.map((item: string) => <button type="button" key={item} className={`choice-tile ${state.objective.primary === item ? "selected" : ""}`} aria-pressed={state.objective.primary === item} onClick={() => selectObjective(item)}><span>{item}</span><small>{item === "顔LoRA" ? "顔立ちと人物特徴" : item === "絵柄／塗りLoRA" ? "描画表現と線・色" : "学習対象として設定"}</small></button>)}</div></Field>
+      {isFaceMode && <section className="panel face-type-panel"><span className="mini-label">FACE LORA MODE</span><h3>顔LoRAの種類</h3><p>選択すると、各属性の「固定／分散／使用しない」の初期値が切り替わります。あとから個別に変更できます。</p><div className="face-type-grid">{FACE_LORA_TYPES.map(([value, label]: string[]) => <button type="button" key={value} className={state.faceLoraType === value ? "selected" : ""} aria-pressed={state.faceLoraType === value} onClick={() => updateFaceLoraType(value)}><strong>{label}</strong><small>{value === "fixed-character" ? "髪色・基本髪型・目色を固定" : value === "style-blend" ? "外見を広く分散し顔立ちを学習対象へ" : value === "general" ? "外見・角度・構図を広く分散" : "現在の役割設定を維持"}</small></button>)}</div></section>}
       <div className="form-grid top-gap"><Field label="副目的（任意）"><select value={state.objective.secondary} onChange={(e) => updateObjective("secondary", e.target.value)}><option value="">設定しない</option>{OBJECTIVES.filter((item) => item !== state.objective.primary).map((item) => <option key={item}>{item}</option>)}</select></Field><Field label="生成予定本数" hint="MVPでは1〜200件"><input type="number" min="1" max="200" value={state.objective.count} onChange={(e) => updateObjective("count", Math.max(1, Math.min(200, Number(e.target.value))))} /></Field></div>
       {(state.objective.primary === "複合タイプ" || state.objective.secondary) && <Notice tone="warning">複数の特徴が常に同時に存在すると、それぞれを個別に制御できず、一まとまりの特徴として学習される可能性があります。</Notice>}
     </>,
@@ -216,12 +334,28 @@ export default function Home() {
       <ContractEditor title="主特徴" description="高い割合で含めるが、全件には固定しない特徴" group="primary" items={state.contract.primary} onAdd={() => addContract("primary")} onUpdate={updateContract} onRemove={removeContract} usage />
       <ContractEditor title="ネガティブ専用" description="対応環境のネガティブ欄だけへ出力" group="negative" items={state.contract.negative} onAdd={() => addContract("negative")} onUpdate={updateContract} onRemove={removeContract} simple />
       <ContractEditor title="ポジティブ側の必須制約" description="single character など、通常プロンプトへ入れる制約" group="constraints" items={state.contract.constraints} onAdd={() => addContract("constraints")} onUpdate={updateContract} onRemove={removeContract} simple />
+      <section className="panel phrase-policy-panel">
+        <div className="panel-header"><div><span className="mini-label">THREE LAYERS</span><h3>生成・学習対象・キャプションを分ける</h3><p>同じ語を一律に消さず、用途ごとに管理します。カンマまたは改行で複数指定できます。</p></div></div>
+        <div className="form-grid">
+          <Field label="元LoRA発動語" hint="画像生成Positiveに残します"><textarea value={state.phrasePolicy.sourceTriggerWords} onChange={(e) => patchState({ phrasePolicy: { ...state.phrasePolicy, sourceTriggerWords: e.target.value }, plan: [] })} placeholder="source_lora_trigger" /></Field>
+          <Field label="キャプション除外語" hint="学習キャプションだけから除外します"><textarea value={state.phrasePolicy.captionExclusions} onChange={(e) => patchState({ phrasePolicy: { ...state.phrasePolicy, captionExclusions: e.target.value } })} placeholder="hair color, outfit tag" /></Field>
+          <Field label="Positive完全禁止語" hint="生成Positiveだけから除外します"><textarea value={state.phrasePolicy.forbiddenPositive} onChange={(e) => patchState({ phrasePolicy: { ...state.phrasePolicy, forbiddenPositive: e.target.value }, plan: [] })} placeholder="不要な語を入力" /></Field>
+          <Field label="学習対象メモ" hint="プロンプトやキャプションには自動挿入しません"><textarea value={state.phrasePolicy.learningTargetMemo} onChange={(e) => patchState({ phrasePolicy: { ...state.phrasePolicy, learningTargetMemo: e.target.value } })} /></Field>
+        </div>
+        <div className="caption-settings">
+          <div><h3>学習キャプション</h3><p>必要な場合だけ有効にし、カード外の専用欄へ出力します。</p></div>
+          <Segmented value={state.captionSettings.enabled ? "有効" : "無効"} options={["有効", "無効"]} label="学習キャプション" onChange={(value) => patchState({ captionSettings: { ...state.captionSettings, enabled: value === "有効" } })} />
+          <Field label="新LoRAトリガーワード"><input value={state.captionSettings.triggerWord} onChange={(e) => patchState({ captionSettings: { ...state.captionSettings, triggerWord: e.target.value } })} placeholder="newface" /></Field>
+          <div className="caption-category-chips" role="group" aria-label="キャプションへ含めるカテゴリ">{state.categories.filter((category: any) => ["hairColor", "hairLength", "hairStyle", "eyeColor", "outfit", "distance", "expression", "background"].includes(category.id)).map((category: any) => { const selected = state.captionSettings.includeCategoryIds.includes(category.id); return <button type="button" key={category.id} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => patchState({ captionSettings: { ...state.captionSettings, includeCategoryIds: selected ? state.captionSettings.includeCategoryIds.filter((id: string) => id !== category.id) : [...state.captionSettings.includeCategoryIds, category.id] } })}>{selected ? "✓ " : ""}{category.label}</button>; })}</div>
+        </div>
+      </section>
       {[...state.contract.required, ...state.contract.primary].some((item: any) => Number(item.promptWeight) > 1.3) && <Notice tone="warning">強い重みです。モデルによっては特徴の過剰表現や生成崩れが起こる可能性があります。</Notice>}
     </>,
     4: <>
-      <SectionTitle eyebrow="STEP 4 / VARIATION" title="固定させたくない属性を散らす" description="カテゴリごとに候補・目標比率・最低／最大件数・強度を設定します。無効なカテゴリは生成と診断から外れます。" />
+      <SectionTitle eyebrow="STEP 4 / VARIATION" title={isFaceMode ? "顔の属性を、日本語で固定・分散する" : "固定させたくない属性を散らす"} description="カテゴリごとに固定／候補から分散／使用しないを選び、日本語チップと比率で学習画像セット全体を設計します。" />
+      {isFaceMode && <section className="panel face-helper-panel"><div className="form-grid compact"><Field label="アスペクト比補助" hint="プロンプト本文には挿入せず属性メモとして保存"><select value={state.faceSettings.aspectRatio} onChange={(e) => patchState({ faceSettings: { ...state.faceSettings, aspectRatio: e.target.value } })}><option>1:1</option><option>4:5</option><option>2:3</option><option>3:5</option><option>9:16</option><option>横長</option><option>指定しない</option></select></Field><Field label="矛盾処理"><select value={state.constraints.contradictionMode} onChange={(e) => patchState({ constraints: { ...state.constraints, contradictionMode: e.target.value } })}><option value="auto">自動調整</option><option value="retry">再抽選を優先</option><option value="warn">警告のみ</option></select></Field></div><Notice>2:3を推奨します。異なる比率でも学習できますが、顔の占有率や構図が極端にばらつかないよう注意してください。</Notice></section>}
       <div className="category-toolbar"><p><strong>{activeCategories.length}</strong>カテゴリを使用中</p><button className="button subtle" type="button" aria-expanded={showDetails} onClick={() => setShowDetails(!showDetails)}>{showDetails ? "詳細カテゴリを閉じる" : "詳細カテゴリを表示"}</button></div>
-      <div className="category-list">{state.categories.filter((category: any) => !category.detail || showDetails).map((category: any) => <CategoryEditor key={category.id} category={category} expanded={expandedCategory === category.id} onExpand={() => setExpandedCategory(expandedCategory === category.id ? "" : category.id)} onToggle={(enabled: boolean) => updateCategory(category.id, { enabled })} onChoice={updateChoice} onDelete={deleteChoice} onAdd={addChoice} onEqualize={equalize} pasteValue={pasteValues[category.id] || ""} onPasteValue={(value: string) => setPasteValues((current) => ({ ...current, [category.id]: value }))} onAddPasted={addPasted} />)}</div>
+      <div className="category-list">{[...state.categories].sort((a: any, b: any) => isFaceMode ? (FACE_CATEGORY_ORDER.indexOf(a.id) < 0 ? 999 : FACE_CATEGORY_ORDER.indexOf(a.id)) - (FACE_CATEGORY_ORDER.indexOf(b.id) < 0 ? 999 : FACE_CATEGORY_ORDER.indexOf(b.id)) : 0).filter((category: any) => !category.detail || showDetails).map((category: any) => <CategoryEditor key={category.id} category={category} expanded={expandedCategory === category.id} onExpand={() => setExpandedCategory(expandedCategory === category.id ? "" : category.id)} onMode={setCategoryMode} onChip={toggleChip} onSelect={selectCategoryChoices} onChoice={updateChoice} onDelete={deleteChoice} onAdd={addChoice} onEqualize={equalize} pasteValue={pasteValues[category.id] || ""} onPasteValue={(value: string) => setPasteValues((current) => ({ ...current, [category.id]: value }))} onAddPasted={addPasted} />)}</div>
     </>,
     5: <>
       <SectionTitle eyebrow="STEP 5 / DISTRIBUTION" title="配分を、乱数より先に決める" description="同じシードなら同じ計画を再現します。禁止条件を守りながら、カテゴリごとの件数を先に確定します。" />
@@ -259,23 +393,114 @@ function ContractEditor({ title, description, group, items, onAdd, onUpdate, onR
   return <section className="panel contract-panel"><div className="panel-header"><div><span className="mini-label">{group.toUpperCase()}</span><h3>{title}</h3><p>{description}</p></div><button type="button" className="button subtle" onClick={onAdd}>＋ 追加</button></div><div className="contract-list">{items.map((item: any) => <div className="contract-row" key={item.id}><input type="checkbox" checked={item.enabled !== false} onChange={(e) => onUpdate(group, item.id, { enabled: e.target.checked })} aria-label={`${item.text || title}を有効にする`} /><input className="grow" value={item.text} placeholder="英語プロンプト" onChange={(e) => onUpdate(group, item.id, { text: e.target.value })} />{!simple && <div className={`contract-metrics ${usage ? "" : "single"}`}>{usage && <label className="contract-field"><span>使用率</span><div className="unit-input"><input type="number" min="0" max="100" value={item.usagePercent} onChange={(e) => onUpdate(group, item.id, { usagePercent: Number(e.target.value) })} /><span className="input-unit" aria-hidden="true">%</span></div></label>}<label className="contract-field"><span>重み</span><input type="number" min="0.5" max="1.5" step="0.05" value={item.promptWeight} onChange={(e) => onUpdate(group, item.id, { promptWeight: Number(e.target.value) })} /></label></div>}<button type="button" className="icon-button danger" aria-label={`${item.text || "項目"}を削除`} onClick={() => onRemove(group, item.id)}>×</button></div>)}</div></section>;
 }
 
-function CategoryEditor({ category, expanded, onExpand, onToggle, onChoice, onDelete, onAdd, onEqualize, pasteValue, onPasteValue, onAddPasted }: any) {
+function CategoryEditor({ category, expanded, onExpand, onMode, onChip, onSelect, onChoice, onDelete, onAdd, onEqualize, pasteValue, onPasteValue, onAddPasted }: any) {
+  const mode = categoryMode(category);
   const enabledChoices = category.choices.filter((choice: any) => choice.enabled);
+  const fixed = category.choices.find((choice: any) => choice.id === category.fixedChoiceId) || enabledChoices[0];
   const total = enabledChoices.reduce((sum: number, choice: any) => sum + Number(choice.targetPercent || 0), 0);
-  return <section className={`category-card ${category.enabled ? "enabled" : ""}`}><header><button className="category-expand" type="button" aria-expanded={expanded} onClick={onExpand}><span className="category-icon" aria-hidden="true">{category.detail ? "+" : category.label.slice(0, 1)}</span><span><strong>{category.label}</strong><small>{enabledChoices.length}候補 ・ 合計 {total.toFixed(1)}%</small></span><b aria-hidden="true">⌄</b></button><label className="switch"><input type="checkbox" checked={category.enabled} onChange={(e) => onToggle(e.target.checked)} /><span /><b>{category.enabled ? "使用" : "不使用"}</b></label></header>{expanded && <div className="category-body"><div className="category-actions"><button type="button" className="button subtle" onClick={() => onAdd(category.id)}>＋ 候補追加</button><button type="button" className="button subtle" onClick={() => onEqualize(category.id)}>均等配分</button><span className={Math.abs(total - 100) < 0.1 ? "ratio-ok" : "ratio-warning"}>合計 {total.toFixed(1)}% {Math.abs(total - 100) < 0.1 ? "✓" : "— 生成時に重みとして正規化"}</span></div><div className="candidate-head"><span>有効</span><span>表示名 / 英語プロンプト</span><span>比率</span><span>最低</span><span>最大</span><span>強度</span><span>重み</span><span /></div>{category.choices.map((choice: any) => <div className="candidate-row" key={choice.id}><input type="checkbox" checked={choice.enabled} onChange={(e) => onChoice(category.id, choice.id, { enabled: e.target.checked })} aria-label={`${choice.labelJa}を有効にする`} /><div className="candidate-text"><input value={choice.labelJa} onChange={(e) => onChoice(category.id, choice.id, { labelJa: e.target.value })} aria-label="日本語表示名" /><input value={choice.promptText} onChange={(e) => onChoice(category.id, choice.id, { promptText: e.target.value })} aria-label="英語プロンプト" /><details className="intensity-editor"><summary>強度別タグを設定</summary>{[["weak", "弱い"], ["standard", "標準"], ["strong", "強い"]].map(([level, label]) => <label key={level}><span>{label}</span><input value={choice.intensityTags?.[level] || ""} placeholder={choice.promptText} onChange={(e) => onChoice(category.id, choice.id, { intensityTags: { ...(choice.intensityTags || {}), [level]: e.target.value } })} /></label>)}</details></div><label><span>比率</span><div><input type="number" min="0" max="100" step="0.1" value={choice.targetPercent} onChange={(e) => onChoice(category.id, choice.id, { targetPercent: Number(e.target.value) })} /><b>%</b></div></label><label><span>最低</span><input type="number" min="0" value={choice.minCount} onChange={(e) => onChoice(category.id, choice.id, { minCount: Number(e.target.value) })} /></label><label><span>最大</span><input type="number" min="0" placeholder="—" value={choice.maxCount ?? ""} onChange={(e) => onChoice(category.id, choice.id, { maxCount: e.target.value === "" ? null : Number(e.target.value) })} /></label><label><span>強度</span><select value={choice.intensityLevel || "standard"} onChange={(e) => onChoice(category.id, choice.id, { intensityLevel: e.target.value })}><option value="weak">弱い</option><option value="slightlyWeak">やや弱い</option><option value="standard">標準</option><option value="slightlyStrong">やや強い</option><option value="strong">強い</option><option value="custom">カスタム</option></select></label><label><span>重み</span><input type="number" min="0.5" max="1.5" step="0.05" value={choice.promptWeight} onChange={(e) => onChoice(category.id, choice.id, { promptWeight: Number(e.target.value) })} /></label><button type="button" className="icon-button danger" aria-label={`${choice.labelJa}を削除`} onClick={() => onDelete(category.id, choice.id)}>×</button></div>)}<details className="paste-box"><summary>複数行を貼り付ける</summary><p>1行に1件。「日本語名 | English prompt」または英語だけで入力できます。</p><textarea value={pasteValue} onChange={(e) => onPasteValue(e.target.value)} placeholder={'赤髪 | red hair\n金髪 | blonde hair'} /><button type="button" className="button primary" onClick={() => onAddPasted(category.id)}>候補へ追加</button></details></div>}</section>;
+  const sensitiveTerms = [...new Map(category.choices.flatMap((choice: any) => detectSensitive(choice.promptText)).map((item: any) => [item.term, item])).values()];
+  const summary = mode === "disabled"
+    ? "使用しない"
+    : mode === "fixed"
+      ? `${fixed?.labelJa || "候補未選択"}で固定`
+      : `${enabledChoices.slice(0, 3).map((choice: any) => choice.labelJa).join("・") || "候補未選択"}${enabledChoices.length > 3 ? `ほか${enabledChoices.length - 3}件` : ""}から分散`;
+  return <section className={`category-card ${mode !== "disabled" ? "enabled" : ""} role-${mode}`} data-category-id={category.id}>
+    <header>
+      <button className="category-expand" type="button" aria-expanded={expanded} onClick={onExpand}>
+        <span className="category-icon" aria-hidden="true">{category.detail ? "+" : category.label.slice(0, 1)}</span>
+        <span><strong>{category.label}</strong><small>{summary}</small></span>
+        <b aria-hidden="true">⌄</b>
+      </button>
+      <span className={`category-role-badge ${mode}`}>{mode === "fixed" ? "固定" : mode === "distributed" ? "分散" : "未使用"}</span>
+    </header>
+    {expanded && <div className="category-body">
+      <div className="role-selector" role="group" aria-label={`${category.label}の役割`}>
+        {[["fixed", "固定"], ["distributed", "候補から分散"], ["disabled", "使用しない"]].map(([value, label]) => <button type="button" key={value} className={mode === value ? "selected" : ""} aria-pressed={mode === value} onClick={() => onMode(category.id, value)}>{mode === value ? "✓ " : ""}{label}</button>)}
+      </div>
+      <div className="category-actions">
+        <button type="button" className="button subtle" onClick={() => onSelect(category.id, "recommended")}>おすすめを選択</button>
+        <button type="button" className="button subtle" onClick={() => onSelect(category.id, "all")}>全選択</button>
+        <button type="button" className="button subtle" onClick={() => onSelect(category.id, "none")}>全解除</button>
+        {category.id === "faceDirection" && <button type="button" className="button subtle" onClick={() => onSelect(category.id, "sides")}>左右セット選択</button>}
+        <button type="button" className="button subtle" onClick={() => onAdd(category.id)}>＋ 自由入力</button>
+      </div>
+      <div className="choice-chip-grid" role="group" aria-label={`${category.label}の候補`}>
+        {category.choices.map((choice: any) => {
+          const selected = mode === "fixed" ? category.fixedChoiceId === choice.id : choice.enabled !== false;
+          return <button type="button" key={choice.id} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => onChip(category.id, choice.id)}>
+            <span>{selected ? "✓ " : ""}{choice.labelJa}</span>
+            <small>{choice.promptText || "プロンプトへ挿入しない"}</small>
+          </button>;
+        })}
+      </div>
+      {sensitiveTerms.length > 0 && <Notice tone="warning">注意語を検出しました: {sensitiveTerms.map((item: any) => `${item.term} → ${item.replacement}`).join(" / ")}。自動では削除しないため、必要に応じて置換してください。</Notice>}
+      {category.id === "hairColorDetail" && enabledChoices.length > 1 && <Notice tone="warning">特殊髪色を複数使うと、配色以外の外見特徴まで学習する可能性があります。</Notice>}
+      <details className="candidate-details">
+        <summary>英語タグ・比率・強度の詳細設定</summary>
+        <div className="category-actions">
+          <button type="button" className="button subtle" onClick={() => onEqualize(category.id)}>均等配分</button>
+          <span className={Math.abs(total - 100) < 0.1 ? "ratio-ok" : "ratio-warning"}>合計 {total.toFixed(1)}% {Math.abs(total - 100) < 0.1 ? "✓" : "— 生成時に正規化"}</span>
+        </div>
+        <div className="candidate-head"><span>有効</span><span>表示名 / 英語プロンプト</span><span>比率</span><span>最低</span><span>最大</span><span>強度</span><span>重み</span><span /></div>
+        {category.choices.map((choice: any) => <div className="candidate-row" key={choice.id}>
+          <input type="checkbox" checked={choice.enabled} onChange={(e) => onChoice(category.id, choice.id, { enabled: e.target.checked })} aria-label={`${choice.labelJa}を有効にする`} />
+          <div className="candidate-text">
+            <input value={choice.labelJa} onChange={(e) => onChoice(category.id, choice.id, { labelJa: e.target.value })} aria-label="日本語表示名" />
+            <textarea value={choice.promptText} onChange={(e) => onChoice(category.id, choice.id, { promptText: e.target.value })} aria-label="英語プロンプト" />
+            <details className="intensity-editor"><summary>強度別タグを設定</summary>{[["weak", "弱い"], ["standard", "標準"], ["strong", "強い"]].map(([level, label]) => <label key={level}><span>{label}</span><input value={choice.intensityTags?.[level] || ""} placeholder={choice.promptText} onChange={(e) => onChoice(category.id, choice.id, { intensityTags: { ...(choice.intensityTags || {}), [level]: e.target.value } })} /></label>)}</details>
+            <div className="phrase-role-controls" role="group" aria-label={`${choice.labelJa}の用途`}>
+              <button type="button" className={choice.includeInPrompt !== false ? "selected" : ""} aria-pressed={choice.includeInPrompt !== false} onClick={() => onChoice(category.id, choice.id, { includeInPrompt: choice.includeInPrompt === false })}>生成Prompt</button>
+              <button type="button" className={choice.learningTarget === true ? "selected" : ""} aria-pressed={choice.learningTarget === true} onClick={() => onChoice(category.id, choice.id, { learningTarget: choice.learningTarget !== true })}>学習対象</button>
+              <button type="button" className={choice.includeInCaption !== false ? "selected" : ""} aria-pressed={choice.includeInCaption !== false} onClick={() => onChoice(category.id, choice.id, { includeInCaption: choice.includeInCaption === false })}>キャプション</button>
+            </div>
+          </div>
+          <label><span>比率</span><div className="unit-input"><input type="number" min="0" max="100" step="0.1" value={choice.targetPercent} onChange={(e) => onChoice(category.id, choice.id, { targetPercent: Number(e.target.value) })} /><span className="input-unit" aria-hidden="true">%</span></div></label>
+          <label><span>最低</span><input type="number" min="0" value={choice.minCount} onChange={(e) => onChoice(category.id, choice.id, { minCount: Number(e.target.value) })} /></label>
+          <label><span>最大</span><input type="number" min="0" placeholder="—" value={choice.maxCount ?? ""} onChange={(e) => onChoice(category.id, choice.id, { maxCount: e.target.value === "" ? null : Number(e.target.value) })} /></label>
+          <label><span>強度</span><select value={choice.intensityLevel || "standard"} onChange={(e) => onChoice(category.id, choice.id, { intensityLevel: e.target.value })}><option value="weak">弱い</option><option value="slightlyWeak">やや弱い</option><option value="standard">標準</option><option value="slightlyStrong">やや強い</option><option value="strong">強い</option><option value="custom">カスタム</option></select></label>
+          <label><span>重み</span><input type="number" min="0.5" max="1.5" step="0.05" value={choice.promptWeight} onChange={(e) => onChoice(category.id, choice.id, { promptWeight: Number(e.target.value) })} /></label>
+          <button type="button" className="icon-button danger" aria-label={`${choice.labelJa}を削除`} onClick={() => onDelete(category.id, choice.id)}>×</button>
+        </div>)}
+        <details className="paste-box"><summary>複数行を貼り付ける</summary><p>1行に1件。「日本語名 | English prompt」または英語だけで入力できます。</p><textarea value={pasteValue} onChange={(e) => onPasteValue(e.target.value)} placeholder={'赤髪 | red hair\n金髪 | blonde hair'} /><button type="button" className="button primary" onClick={() => onAddPasted(category.id)}>候補へ追加</button></details>
+      </details>
+    </div>}
+  </section>;
 }
 
 function EmptyPlan({ onCreate }: { onCreate: () => void }) { return <div className="empty-state"><div aria-hidden="true"><span /><span /><span /></div><h3>まだ学習計画がありません</h3><p>候補の件数と制約を計算し、シード付きで再現できる計画を作ります。</p><button className="button primary large" type="button" onClick={onCreate}>今の設定で計画を生成</button></div>; }
 
 function DistributionTable({ state, counts }: any) {
-  return <div className="table-card"><div className="table-title"><div><span className="mini-label">DISTRIBUTION MAP</span><h3>計画上の属性使用件数</h3></div><span>全 {state.plan.length}件</span></div>{state.categories.filter((category: any) => category.enabled).map((category: any) => <div className="distribution-group" key={category.id}><strong>{category.label}</strong><div>{category.choices.filter((choice: any) => choice.enabled).map((choice: any) => { const count = counts[category.id]?.[choice.id] || 0; return <span key={choice.id}><b>{choice.labelJa}</b><i><em style={{ width: `${state.plan.length ? count / state.plan.length * 100 : 0}%` }} /></i><strong>{count}</strong></span>; })}</div></div>)}</div>;
+  return <div className="table-card"><div className="table-title"><div><span className="mini-label">DISTRIBUTION MAP</span><h3>計画上の属性使用件数</h3></div><span>全 {state.plan.length}件</span></div>{state.categories.filter((category: any) => categoryMode(category) !== "disabled").map((category: any) => <div className="distribution-group" key={category.id}><strong>{category.label}<small>{categoryMode(category) === "fixed" ? "固定" : "分散"}</small></strong><div>{category.choices.filter((choice: any) => choice.enabled).map((choice: any) => { const count = counts[category.id]?.[choice.id] || 0; return <span key={choice.id}><b>{choice.labelJa}</b><i><em style={{ width: `${state.plan.length ? count / state.plan.length * 100 : 0}%` }} /></i><strong>{count}</strong></span>; })}</div></div>)}</div>;
 }
 
 function PromptCard({ row, state, choices, onCopy, onStatus, onPatch, onReplace }: any) {
   const built = buildPrompt(row, state);
   const [attributesOpen, setAttributesOpen] = useState(false);
   const [reasonsOpen, setReasonsOpen] = useState(false);
-  return <article className={`prompt-card status-${row.status}`}><header><div><span className="number">No.{String(row.number).padStart(2, "0")}</span><span className="status-chip">{STATUS.find(([value]) => value === row.status)?.[1]}</span>{row.locked && <span className="locked-chip">固定中</span>}</div><div className="card-actions"><button type="button" className="icon-button" aria-label={row.locked ? "固定を解除" : "カードを固定"} aria-pressed={row.locked} onClick={() => onPatch(row.id, { locked: !row.locked })}>{row.locked ? "◆" : "◇"}</button><button type="button" className="button subtle" disabled={row.locked} onClick={() => onReplace(row.id)}>配分を保って差し替え</button></div></header><div className="prompt-block"><div><span>Prompt</span>{built.sensitive.length > 0 && <b className="sensitive-badge">注意語 {built.sensitive.length}</b>}</div><code>{built.prompt}</code><button type="button" className="button copy" onClick={() => onCopy(built.prompt, `No.${String(row.number).padStart(2, "0")}のプロンプトをコピーしました`)}>プロンプトをコピー</button></div>{built.negative && <div className="negative-block"><span>Negative prompt</span><code>{built.negative}</code><button type="button" className="button subtle" onClick={() => onCopy(built.negative, `No.${String(row.number).padStart(2, "0")}のネガティブをコピーしました`)}>ネガティブをコピー</button></div>}{built.sensitive.length > 0 && <div className="sensitive-list">{built.sensitive.map((item: any) => <span key={item.term}><b>{item.term}</b> → {item.replacement}</span>)}</div>}<div className="status-selector" role="group" aria-label={`No.${row.number}の状態`}>{STATUS.map(([value, label]) => <button type="button" key={value} aria-pressed={row.status === value} className={row.status === value ? "selected" : ""} onClick={() => { onStatus(row.id, value); if (value === "rejected") setReasonsOpen(true); }}>{label}</button>)}</div>{row.status === "rejected" && <div className="rejection-box"><button className="disclosure" type="button" aria-expanded={reasonsOpen} onClick={() => setReasonsOpen(!reasonsOpen)}>不採用理由を記録 <span>⌄</span></button>{reasonsOpen && <div className="reason-grid">{REJECTION_REASONS.map((reason) => <label key={reason}><input type="checkbox" checked={row.rejectionReasons.includes(reason)} onChange={(e) => onPatch(row.id, { rejectionReasons: e.target.checked ? [...row.rejectionReasons, reason] : row.rejectionReasons.filter((item: string) => item !== reason) })} /><span>{reason}</span></label>)}</div>}</div>}<button className="disclosure" type="button" aria-expanded={attributesOpen} onClick={() => setAttributesOpen(!attributesOpen)}>属性とメモ <span>⌄</span></button>{attributesOpen && <div className="attribute-area"><div>{Object.entries(row.attributes).map(([categoryId, choiceId]: any) => choices[choiceId] && <span key={categoryId}><b>{choices[choiceId].categoryLabel}</b>{choices[choiceId].labelJa}</span>)}</div><label><span>メモ</span><textarea value={row.note} onChange={(e) => onPatch(row.id, { note: e.target.value })} placeholder="生成後の確認や修正点を記録" /></label></div>}</article>;
+  const selectedLearningTargets = Object.values(row.attributes).map((choiceId: any) => choices[choiceId]).filter((choice: any) => choice?.learningTarget).map((choice: any) => choice.labelJa);
+  return <article className={`prompt-card status-${row.status}`}>
+    <header>
+      <div><span className="number">No.{String(row.number).padStart(2, "0")}</span><span className="status-chip">{STATUS.find(([value]) => value === row.status)?.[1]}</span>{row.locked && <span className="locked-chip">固定中</span>}</div>
+      <div className="card-actions"><button type="button" className="icon-button" aria-label={row.locked ? "固定を解除" : "カードを固定"} aria-pressed={row.locked} onClick={() => onPatch(row.id, { locked: !row.locked })}>{row.locked ? "◆" : "◇"}</button><button type="button" className="button subtle" disabled={row.locked} onClick={() => onReplace(row.id)}>配分を保って差し替え</button></div>
+    </header>
+    <div className="prompt-block">
+      <div><span>Prompt</span>{built.sensitive.length > 0 && <b className="sensitive-badge">注意語 {built.sensitive.length}</b>}</div>
+      <code>{built.prompt}</code>
+      <button type="button" className="button copy" onClick={() => onCopy(built.prompt, `No.${String(row.number).padStart(2, "0")}のプロンプトをコピーしました`)}>プロンプトをコピー</button>
+    </div>
+    {built.negative && <div className="negative-block"><span>Negative prompt</span><code>{built.negative}</code><button type="button" className="button subtle" onClick={() => onCopy(built.negative, `No.${String(row.number).padStart(2, "0")}のネガティブをコピーしました`)}>ネガティブをコピー</button></div>}
+    {built.caption && <div className="caption-block"><span>学習キャプション</span><code>{built.caption}</code><button type="button" className="button subtle" onClick={() => onCopy(built.caption, `No.${String(row.number).padStart(2, "0")}のキャプションをコピーしました`)}>キャプションをコピー</button></div>}
+    {built.sensitive.length > 0 && <div className="sensitive-list">{built.sensitive.map((item: any) => <span key={item.term}><b>{item.term}</b> → {item.replacement}</span>)}</div>}
+    {built.adjustments.length > 0 && <div className="adjustment-log"><strong>自動調整</strong>{built.adjustments.map((item: string) => <span key={item}>{item}</span>)}</div>}
+    <div className="status-selector" role="group" aria-label={`No.${row.number}の状態`}>{STATUS.map(([value, label]) => <button type="button" key={value} aria-pressed={row.status === value} className={row.status === value ? "selected" : ""} onClick={() => { onStatus(row.id, value); if (value === "rejected") setReasonsOpen(true); }}>{label}</button>)}</div>
+    {row.status === "rejected" && <div className="rejection-box"><button className="disclosure" type="button" aria-expanded={reasonsOpen} onClick={() => setReasonsOpen(!reasonsOpen)}>不採用理由を記録 <span>⌄</span></button>{reasonsOpen && <div className="reason-grid">{REJECTION_REASONS.map((reason) => <label key={reason}><input type="checkbox" checked={row.rejectionReasons.includes(reason)} onChange={(e) => onPatch(row.id, { rejectionReasons: e.target.checked ? [...row.rejectionReasons, reason] : row.rejectionReasons.filter((item: string) => item !== reason) })} /><span>{reason}</span></label>)}</div>}</div>}
+    <button className="disclosure" type="button" aria-expanded={attributesOpen} onClick={() => setAttributesOpen(!attributesOpen)}>属性・生成メモ・学習対象 <span>⌄</span></button>
+    {attributesOpen && <div className="attribute-area">
+      <div>{Object.entries(row.attributes).map(([categoryId, choiceId]: any) => choices[choiceId] && <span key={categoryId}><b>{choices[choiceId].categoryLabel}</b>{choices[choiceId].labelJa}</span>)}</div>
+      <dl className="metadata-list"><div><dt>アスペクト比</dt><dd>{state.faceSettings?.aspectRatio || "指定しない"}</dd></div><div><dt>学習対象候補</dt><dd>{selectedLearningTargets.join("、") || "未設定"}</dd></div><div><dt>学習対象メモ</dt><dd>{state.phrasePolicy?.learningTargetMemo || "未設定"}</dd></div></dl>
+      <label><span>メモ</span><textarea value={row.note} onChange={(e) => onPatch(row.id, { note: e.target.value })} placeholder="生成後の確認や修正点を記録" /></label>
+    </div>}
+  </article>;
 }
 
 function ShortageTable({ shortages }: any) {
